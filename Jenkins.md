@@ -171,6 +171,232 @@ pipeline {
     }
 }
 ```
+## Jenkins + Docker Integration
+
+### Building Docker Images in Jenkins
+
+* Jenkins pipelines can automate Docker image builds using `docker build`.
+* Common flow:
+
+  1. Pull latest code
+  2. Build Docker image
+  3. Tag image
+  4. Push to registry
+  5. Deploy container
+
+### Running Docker Commands from Jenkins
+
+**Important**: Jenkins user must be added to the `docker` group.
+
+```bash
+sudo usermod -aG docker jenkins
+sudo systemctl restart jenkins
+```
+
+### Example Pipeline for Docker Build
+
+```groovy
+pipeline {
+    agent any
+
+    stages {
+        stage('Build Docker Image') {
+            steps {
+                sh 'docker build -t myapp:latest .'
+            }
+        }
+
+        stage('Run Container') {
+            steps {
+                sh 'docker run -d -p 8080:8080 myapp:latest'
+            }
+        }
+    }
+}
+```
+
+### Docker Compose in Jenkins
+
+* Used when applications require multiple services.
+* Example: Backend + PostgreSQL + Redis.
+
+```groovy
+stage('Deploy') {
+    steps {
+        sh 'docker compose up -d --build'
+    }
+}
+```
+
+### Real Issues I Faced
+
+* Docker socket permission denied
+* Container naming conflicts
+* Build context issues
+* Incorrect COPY paths in Dockerfile
+* Environment variable replacement inside compose files
+* Volume mount permission problems
+
+
+## Shell Scripting in Jenkins Pipelines
+
+### Importance of Shell Scripts
+
+* Keeps Jenkinsfile clean and maintainable.
+* Complex deployment logic should be moved into `.sh` files.
+
+### Common Commands I Frequently Used
+
+```bash
+chmod +x script.sh
+./script.sh
+```
+
+### Variable Replacement Using `sed`
+
+```bash
+sed -i "s|OLD_VALUE|NEW_VALUE|g" .env
+```
+
+### Advanced Replacement Handling
+
+* Avoid replacing values globally by mistake.
+* Use scoped replacements carefully.
+* Sometimes `awk` is safer than `sed`.
+
+### Multi-line Script Usage in Jenkins
+
+```groovy
+sh '''
+echo "Starting deployment"
+docker compose down
+docker compose up -d --build
+'''
+```
+
+### Problems I Solved
+
+* Wrong variable interpolation
+* Script execution permissions
+* Relative path failures
+* Shell compatibility issues (`sh` vs `bash`)
+* Entrypoint execution failures
+
+
+## Production-Level Jenkins Learnings
+
+### CI/CD Flow Understanding
+
+Typical workflow I worked with:
+
+1. Developer pushes code
+2. Jenkins detects changes
+3. Pipeline starts automatically
+4. Build process executes
+5. Docker images created
+6. Services deployed
+7. Logs monitored for failures
+
+---
+
+### Importance of Environment Separation
+
+Different environments should have separate:
+
+* `.env` files
+* Docker compose files
+* Credentials
+* Deployment configurations
+
+Example:
+
+```bash
+.env.dev
+.env.staging
+.env.prod
+```
+
+---
+
+### Deployment Safety Practices
+
+* Always backup before deployment
+* Avoid hardcoded values
+* Validate compose files before deployment
+* Test scripts manually before Jenkins integration
+
+---
+
+### Real Troubleshooting Experience
+
+#### PostgreSQL Container Initialization Issues
+
+**Symptoms**:
+
+* Container repeatedly restarting
+* Database not accepting connections
+
+**Causes**:
+
+* Incorrect mounted volume permissions
+* Existing corrupted database data
+* Invalid environment variables
+
+---
+
+#### Entrypoint Failures
+
+**Symptoms**:
+
+```bash
+exec format error
+permission denied
+```
+
+**Solutions**:
+
+```bash
+chmod +x entrypoint.sh
+dos2unix entrypoint.sh
+```
+
+---
+
+#### Jenkins Workspace Problems
+
+**Issues Faced**:
+
+* Old files causing conflicts
+* Stale Docker containers
+* Broken cached builds
+
+**Solutions**:
+
+```groovy
+cleanWs()
+```
+
+or manually:
+
+```bash
+rm -rf workspace/*
+```
+
+---
+
+### Most Important Practical Learning
+
+A pipeline is not just writing Jenkins syntax.
+
+Real DevOps work includes:
+
+* debugging deployments
+* handling permissions
+* fixing infrastructure issues
+* managing environments
+* automating safely
+* reducing manual operational work
+
 
 > **Placeholder**: Add your actual Jenkinsfiles, complex `sh` scripts, credential usage patterns, or `.env` loading examples here.
 
@@ -215,6 +441,7 @@ sh 'echo $JOB_NAME'
 // Correct
 sh "echo ${env.JOB_NAME}"
 ```
+
 
 ### Importance of `.env` Files (Real Example)
 
