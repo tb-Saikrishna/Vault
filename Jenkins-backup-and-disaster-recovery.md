@@ -11,7 +11,7 @@
 | **Document Version** | 1.0 |
 | **Created Date** | 2026-06-22 |
 | **Last Updated** | 2026-06-22 |
-| **Author** | Infrastructure Team |
+| **Author** | DevOps Team |
 | **Target System** | Jenkins Master VM |
 | **Jenkins Master IP** | 192.168.0.17 |
 | **Backup Server IP** | 192.168.0.127 |
