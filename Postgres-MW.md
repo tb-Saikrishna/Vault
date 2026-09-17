@@ -1,13 +1,13 @@
 # PostgreSQL High Availability Cluster — Implementation Report
 
-**Project:** Containerized PostgreSQL HA Cluster (Master-Standby & Multi-Master)
+**Project:** Containerized PostgreSQL HA Cluster (Master-Standby)
 **Environment:** Two-node setup on Ubuntu hosts with Docker
 **Nodes:**
 - **Node 1** — hostname `Forge`, IP `192.168.0.28`
 - **Node 2** — hostname `test`, IP `192.168.0.163`
 
 **Document Date:** 2026-09-17
-**Status:** Master-Standby cluster **operational and failover-verified** · Multi-Master cluster **planned**
+**Status:** Master-Standby cluster **operational and failover-verified** ·
 
 ---
 
