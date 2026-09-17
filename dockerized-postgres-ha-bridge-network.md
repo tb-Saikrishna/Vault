@@ -6,8 +6,8 @@
 - **Node 1** — hostname `Forge`, IP `192.168.0.28`
 - **Node 2** — hostname `test`, IP `192.168.0.163`
 
-**Document Date:** 2026-09-15
-**Status:** Master-Standby cluster **operational** · Multi-Master cluster **planned**
+**Document Date:** 2026-09-17
+**Status:** Master-Standby cluster **operational and failover-verified** · Multi-Master cluster **planned**
 
 ---
 
@@ -22,11 +22,12 @@
 7. [Phase 3 — Custom Docker Compose (Working Solution)](#7-phase-3--custom-docker-compose-working-solution)
 8. [Detailed Technical Walkthrough](#8-detailed-technical-walkthrough)
 9. [Test Cases & Results](#9-test-cases--results)
-10. [Key Concepts Explained](#10-key-concepts-explained)
-11. [Issues Encountered & Resolutions](#11-issues-encountered--resolutions)
-12. [Operational Runbook](#12-operational-runbook)
-13. [Next Steps — pgactive Multi-Master](#13-next-steps--pgactive-multi-master)
-14. [Appendices](#14-appendices)
+10. [Failover Test — Detailed Walkthrough](#10-failover-test--detailed-walkthrough)
+11. [Key Concepts Explained](#11-key-concepts-explained)
+12. [Issues Encountered & Resolutions](#12-issues-encountered--resolutions)
+13. [Operational Runbook](#13-operational-runbook)
+14. [Next Steps — pgactive Multi-Master](#14-next-steps--pgactive-multi-master)
+15. [Appendices](#15-appendices)
 
 ---
 
@@ -44,9 +45,12 @@ After evaluating three different toolchains (Patroni+etcd, repmgr, and a hand-ro
 - No external dependencies (no etcd, Patroni, or repmgr)
 - Reproducible, declarative setup
 
-**Result:** Master-standby cluster is **operational and verified** with seven passing replication test cases.
+**Result:**
+- Master-standby cluster is **operational**.
+- Streaming replication verified with seven passing data-replication test cases.
+- **Failover verified end-to-end** — the standby was promoted, accepted writes on a new timeline, and the old primary was successfully re-joined as a standby of the new primary.
 
-**Pending:** Failover test and the `pgactive` multi-master implementation.
+**Pending:** The `pgactive` multi-master implementation.
 
 ---
 
@@ -58,7 +62,7 @@ After evaluating three different toolchains (Patroni+etcd, repmgr, and a hand-ro
 | 2 | Verify streaming replication with a dummy table | ✅ Complete |
 | 3 | Confirm the standby is read-only and rejects writes | ✅ Complete |
 | 4 | Evaluate multiple HA toolchains and select the most robust | ✅ Complete |
-| 5 | Test failover (promote standby, rejoin old primary) | ⏳ Pending |
+| 5 | Test failover (promote standby, rejoin old primary) | ✅ Complete |
 | 6 | Deploy and validate a `pgactive` multi-master cluster | ⏳ Pending |
 
 ---
@@ -119,6 +123,7 @@ After evaluating three different toolchains (Patroni+etcd, repmgr, and a hand-ro
 | 1 | `manwilzaki/ha-postgres` (Patroni + etcd + HAProxy) | ❌ Abandoned | Repeated failures across networking, bootstrap, and auth layers |
 | 2 | `soldevelo/postgresql-repmgr` (Bitnami fork) | ❌ Abandoned | Container ran as UID 1001 with no passwd entry; `repmgr` refused to run |
 | 3 | Custom `docker-compose.yml` with `postgres:16-alpine` | ✅ **Working** | Transparent, no external deps, fully under our control |
+| 3b | Failover rehearsal on the working cluster | ✅ **Verified** | Promote, write-forward, re-join tested end-to-end |
 
 ---
 
@@ -260,8 +265,6 @@ sudo systemctl stop postgresql
 **`docker-compose.yml`:**
 
 ```yaml
-version: '3.8'
-
 services:
   postgres-primary:
     image: postgres:16-alpine
@@ -371,8 +374,6 @@ Should show a row: `host | {replication} | {replicator} | 0.0.0.0`.
 **`docker-compose.yml`:**
 
 ```yaml
-version: '3.8'
-
 services:
   postgres-standby:
     image: postgres:16-alpine
@@ -402,34 +403,37 @@ networks:
     driver: bridge
 ```
 
-**`standby-entrypoint.sh`:**
+**`standby-entrypoint.sh` (final, corrected version):**
+
+The wait-loop must live **inside** the `if [ ! -f PG_VERSION ]` block. If it's outside, an already-initialized container will block forever waiting for a primary that may no longer exist.
 
 ```bash
 #!/bin/bash
 set -e
 
-# Wait for the primary to be reachable
-until pg_isready -h 192.168.0.28 -p 5432 -U admin -q; do
-  echo "Waiting for primary at 192.168.0.28:5432..."
-  sleep 2
-done
-
-# If data directory is empty, perform a base backup
 if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
-  echo "Starting base backup from primary..."
+  echo "Data directory empty; preparing for base backup..."
+
+  until pg_isready -h <PRIMARY_HOST> -p <PRIMARY_PORT> -U admin -q; do
+    echo "Waiting for primary at <PRIMARY_HOST>:<PRIMARY_PORT>..."
+    sleep 2
+  done
+
   mkdir -p /var/lib/postgresql/data
   chown -R postgres:postgres /var/lib/postgresql
   chmod 700 /var/lib/postgresql/data
 
+  echo "Starting base backup..."
   gosu postgres env PGPASSWORD=replicator123 \
     pg_basebackup \
-      -h 192.168.0.28 -p 5432 \
+      -h <PRIMARY_HOST> -p <PRIMARY_PORT> \
       -U replicator \
       -D /var/lib/postgresql/data \
       -Fp -Xs -R -P -v
+else
+  echo "Data directory already initialized; skipping base backup."
 fi
 
-# Hand off to the official entrypoint (handles privilege drop)
 exec /usr/local/bin/docker-entrypoint.sh "$@"
 ```
 
@@ -456,7 +460,10 @@ local   all             all                                     trust
 host    all             all             127.0.0.1/32            trust
 host    all             all             ::1/128                 trust
 host    all             all             0.0.0.0/0               md5
+host    replication     replicator      0.0.0.0/0               md5
 ```
+
+> The last line (`host replication ...`) must be present on the **standby** when it becomes a primary, so that other nodes can stream from it.
 
 **Start the standby:**
 ```bash
@@ -571,14 +578,18 @@ Expected: `ERROR: cannot execute INSERT in a read-only transaction`.
 | DAT-06 | New row visible on standby | `count = 4` | Confirmed | ✅ |
 | DAT-07 | Standby rejects writes | `read-only transaction` error | Confirmed | ✅ |
 
-### 9.4 Failover (Pending)
+### 9.4 Failover (Complete)
 
 | ID | Test Case | Expected | Actual | Status |
 |----|-----------|----------|--------|--------|
-| FAI-01 | Promote standby | Primary role | Not run | ⏳ |
-| FAI-02 | Promoted node accepts writes | `INSERT` succeeds | Not run | ⏳ |
-| FAI-03 | `pg_is_in_recovery()` returns `f` | `f` | Not run | ⏳ |
-| FAI-04 | Rejoin old primary as standby | Streams again | Not run | ⏳ |
+| FAI-01 | Promote standby | Primary role | `pg_ctl promote` succeeded; timeline bumped to 2 | ✅ |
+| FAI-02 | Promoted node accepts writes | `INSERT` succeeds | `INSERT 0 1` for `post-failover` | ✅ |
+| FAI-03 | `pg_is_in_recovery()` returns `f` | `f` | `f` | ✅ |
+| FAI-04 | Timeline advances | `2` | `2` | ✅ |
+| FAI-05 | Old primary rejoined as standby | Base backup + streaming | `pg_basebackup` completed; `started streaming WAL from primary at timeline 2` | ✅ |
+| FAI-06 | Replication direction reversed | Node 2 → Node 1 | `192.168.0.28 / streaming / async` on Node 2 | ✅ |
+| FAI-07 | New standby read-only | `INSERT` rejected | `cannot execute INSERT in a read-only transaction` | ✅ |
+| FAI-08 | Data integrity post-failover | All 6 rows on both nodes | Confirmed (6 rows on both) | ✅ |
 
 ### 9.5 Multi-Master (Pending)
 
@@ -598,9 +609,289 @@ Expected: `ERROR: cannot execute INSERT in a read-only transaction`.
 
 ---
 
-## 10. Key Concepts Explained
+## 10. Failover Test — Detailed Walkthrough
 
-### 10.1 Streaming Replication
+The failover test was carried out in four phases, with verification at each stage. The initial state was Node 1 as primary (timeline 1) and Node 2 as standby, with 4 rows in `dummy_ha`.
+
+### 10.1 Phase A — Pre-Flight Verification
+
+**On Node 1 (primary):**
+
+```bash
+docker exec -i postgres-primary psql -U admin -d mydb -c \
+  "SELECT client_addr, state, sync_state FROM pg_stat_replication;"
+
+docker exec -i postgres-primary psql -U admin -d mydb -c \
+  "SELECT timeline_id FROM pg_control_checkpoint();"
+
+docker exec -i postgres-primary psql -U admin -d mydb -c \
+  "SELECT * FROM dummy_ha ORDER BY id;"
+```
+
+**Result:**
+- `pg_stat_replication`: `192.168.0.163 / streaming / async`
+- `timeline_id = 1`
+- `dummy_ha`: 4 rows (alpha, beta, gamma, delta)
+
+**On Node 2 (standby):**
+
+```bash
+docker exec -i postgres-standby psql -U admin -d mydb -c \
+  "SELECT pg_is_in_recovery();"
+
+docker exec -i postgres-standby psql -U admin -d mydb -c \
+  "SELECT count(*) FROM dummy_ha;"
+```
+
+**Result:**
+- `pg_is_in_recovery = t`
+- `count = 4`
+
+✅ Pre-flight state clean.
+
+### 10.2 Phase B — Promote Node 2
+
+**Step 1 — Stop Node 1 (simulate primary failure):**
+
+```bash
+cd ~/pg-ha-cluster
+docker compose stop postgres-primary
+```
+
+Verified: `docker ps --filter name=postgres-primary` returned no running container.
+
+**Step 2 — Promote Node 2:**
+
+The official `postgres` image runs as root by default for `docker exec`, and `pg_ctl` refuses to run as root. The promotion must be executed as the `postgres` user:
+
+```bash
+docker exec -u postgres -i postgres-standby pg_ctl promote -D /var/lib/postgresql/data
+```
+
+Output:
+```
+waiting for server to promote.... done
+server promoted
+```
+
+**Step 3 — Observe promotion in logs:**
+
+```
+LOG:  received promote request
+LOG:  redo done at 0/502A078 system usage: CPU: user: 0.34 s, system: 1.13 s, elapsed: 143370.50 s
+LOG:  last completed transaction was at log time 2026-09-15 12:36:57.861838+00
+LOG:  selected new timeline ID: 2
+LOG:  archive recovery complete
+LOG:  database system is ready to accept connections
+```
+
+**Step 4 — Verify promotion:**
+
+```bash
+docker exec -i postgres-standby psql -U admin -d mydb -c \
+  "SELECT pg_is_in_recovery();"
+# f
+
+docker exec -i postgres-standby psql -U admin -d mydb -c \
+  "SELECT timeline_id FROM pg_control_checkpoint();"
+# 2
+```
+
+**Step 5 — Write to new primary:**
+
+```bash
+docker exec -i postgres-standby psql -U admin -d mydb -c \
+  "INSERT INTO dummy_ha (name, value) VALUES ('post-failover', 500.00);"
+# INSERT 0 1
+```
+
+5 rows total, with `post-failover` as the last row.
+
+✅ Node 2 is now the sole primary. Writes succeed. Node 1 is offline.
+
+### 10.3 Phase C — Rejoin Node 1 as a Standby of Node 2
+
+**Step 1 — Prepare Node 2's HBA to accept replication:**
+
+Append a replication rule to `~/pg-ha-cluster/standby/pg_hba.conf` on Node 2:
+
+```
+host replication replicator 0.0.0.0/0 md5
+```
+
+Restart Node 2:
+
+```bash
+docker compose restart postgres-standby
+```
+
+Verify:
+
+```bash
+docker exec -i postgres-standby psql -U admin -d mydb -c \
+  "SELECT type, database, user_name, address FROM pg_hba_file_rules WHERE type='host';"
+```
+
+Expected: 4 rows including `host | {replication} | {replicator} | 0.0.0.0`.
+
+**Step 2 — Test replication connectivity from Node 1:**
+
+```bash
+timeout 3 bash -c '</dev/tcp/192.168.0.163/5433' && echo "5433 OPEN" || echo "5433 CLOSED"
+# 5433 OPEN
+
+PGPASSWORD=replicator123 psql -h 192.168.0.163 -p 5433 -U replicator -d postgres \
+  -c "SELECT current_user;"
+# current_user
+# --------------
+#  replicator
+```
+
+**Step 3 — Rewrite Node 1 as a standby:**
+
+- Created `~/pg-ha-cluster/standby-entrypoint.sh` pointing at `192.168.0.163:5433` (corrected version, with the wait-loop inside the `if`).
+- Created `~/pg-ha-cluster/standby/postgresql.conf` and `standby/pg_hba.conf`.
+- Backed up the primary compose file to `docker-compose.yml.primary-backup`.
+- Wrote a new `docker-compose.yml` with the standby service (`postgres-standby-node1`) using the wrapper entrypoint.
+
+**Step 4 — Wipe Node 1's old primary volume:**
+
+```bash
+docker compose down --remove-orphans
+docker volume rm pg-ha-cluster_primary_data
+docker volume rm pg-ha-cluster_standby_data
+```
+
+**Step 5 — Start Node 1 as standby:**
+
+```bash
+docker compose up -d
+docker compose logs -f postgres-standby-node1
+```
+
+Log sequence:
+```
+Data directory empty; preparing for base backup from Node 2...
+Starting base backup from primary (Node 2)...
+pg_basebackup: write-ahead log start point: 0/6000028 on timeline 2
+pg_basebackup: base backup completed
+PostgreSQL Database directory appears to contain a database; Skipping initialization
+LOG:  entering standby mode
+LOG:  starting backup recovery with redo LSN 0/6000028, checkpoint LSN 0/6000060, on timeline ID 2
+LOG:  database system is ready to accept read-only connections
+LOG:  started streaming WAL from primary at 0/7000000 on timeline 2
+```
+
+✅ Node 1 has re-joined as a standby of Node 2, streaming on timeline 2.
+
+### 10.4 Phase D — Final Verification
+
+**On Node 2 (new primary):**
+
+```bash
+docker exec -i postgres-standby psql -U admin -d mydb -c \
+  "SELECT client_addr, state, sync_state FROM pg_stat_replication;"
+```
+
+Result:
+```
+ client_addr  |   state   | sync_state
+--------------+-----------+------------
+ 192.168.0.28 | streaming | async
+```
+
+**On Node 1 (new standby):**
+
+```bash
+docker exec -i postgres-standby-node1 psql -U admin -d mydb -c \
+  "SELECT pg_is_in_recovery();"
+# t
+
+docker exec -i postgres-standby-node1 psql -U admin -d mydb -c \
+  "SELECT timeline_id FROM pg_control_checkpoint();"
+# 2
+
+docker exec -i postgres-standby-node1 psql -U admin -d mydb -c \
+  "SELECT count(*) FROM dummy_ha;"
+# 5
+```
+
+**Write-forward test:**
+
+```bash
+# On Node 2 (new primary)
+docker exec -i postgres-standby psql -U admin -d mydb -c \
+  "INSERT INTO dummy_ha (name, value) VALUES ('after-rejoin', 600.00);"
+# INSERT 0 1
+
+# On Node 1 (new standby)
+docker exec -i postgres-standby-node1 psql -U admin -d mydb -c \
+  "SELECT count(*) FROM dummy_ha;"
+# 6
+```
+
+**Read-only enforcement on new standby:**
+
+```bash
+docker exec -i postgres-standby-node1 psql -U admin -d mydb -c \
+  "INSERT INTO dummy_ha (name, value) VALUES ('should-fail', 0);"
+# ERROR:  cannot execute INSERT in a read-only transaction
+```
+
+**Final data snapshot on Node 2:**
+
+```
+ id |     name      | value  |          created_at
+----+---------------+--------+-------------------------------
+  1 | alpha         | 100.50 | 2026-09-15 12:35:49.661865+00
+  2 | beta          | 200.75 | 2026-09-15 12:35:49.661865+00
+  3 | gamma         | 300.25 | 2026-09-15 12:35:49.661865+00
+  4 | delta         | 400.00 | 2026-09-15 12:36:57.857364+00
+ 34 | post-failover | 500.00 | 2026-09-17 04:23:30.459997+00
+ 35 | after-rejoin  | 600.00 | 2026-09-17 05:07:00.469961+00
+(6 rows)
+```
+
+✅ All checks passed. Failover and rejoin complete.
+
+### 10.5 Summary Table
+
+| Stage | Primary | Standby | Timeline | Direction | Rows |
+|-------|---------|---------|----------|-----------|------|
+| Initial | Node 1 | Node 2 | 1 | 1 → 2 | 4 |
+| After promotion | Node 2 | — | 2 | — | 5 |
+| After rejoin | Node 2 | Node 1 | 2 | 2 → 1 | 5 |
+| After write-forward | Node 2 | Node 1 | 2 | 2 → 1 | 6 |
+
+### 10.6 Observed Behaviour — Sequence ID Jump
+
+The `id` values in `dummy_ha` jumped from `4` to `34` then `35` across the failover. This is **expected behaviour**:
+
+- PostgreSQL sequences use a **cache** (default 32) on the primary to reduce WAL writes.
+- The old primary (Node 1) had cached IDs 5–36 in memory at the time of failover.
+- Those cached values were never flushed to WAL, so the standby never saw them.
+- After promotion, Node 2's sequence resumed from its own cached position — producing 34, 35, etc.
+
+**This is not a data integrity issue**, but it means IDs are not strictly contiguous across failovers. Mitigations:
+
+1. Set `CACHE 1` on sequences (performance cost, strict ordering).
+2. Use UUIDs or application-managed IDs.
+
+Neither is required for correctness; noted for the runbook.
+
+### 10.7 Known Limitation — No Automatic Failover
+
+A two-node topology has **no quorum witness**. Automatic failover cannot be made reliable without a third node or a witness service (etcd, Consul, or a lightweight witness). Production deployments requiring automatic failover should:
+
+- Add a third node (1 primary + 2 standbys), or
+- Add a witness node, or
+- Use an HA manager (Patroni with a 3-node etcd, or repmgr with a witness).
+
+---
+
+## 11. Key Concepts Explained
+
+### 11.1 Streaming Replication
 
 PostgreSQL records every change in a **Write-Ahead Log (WAL)**. In streaming replication, the primary continuously ships WAL records to the standby over a TCP connection. The standby applies these records to its own copy of the data files, keeping it byte-identical to the primary.
 
@@ -611,7 +902,7 @@ PostgreSQL records every change in a **Write-Ahead Log (WAL)**. In streaming rep
 4. Standby's **startup process** applies records continuously.
 5. The standby is always in **recovery mode** — it accepts only read queries.
 
-### 10.2 Replication Slots
+### 11.2 Replication Slots
 
 A replication slot is a mechanism that prevents the primary from discarding WAL segments that a standby hasn't yet received. Without a slot, the primary might recycle WAL that a temporarily-disconnected standby needs, causing the standby to fall behind irrecoverably.
 
@@ -620,25 +911,35 @@ A replication slot is a mechanism that prevents the primary from discarding WAL 
 SELECT pg_create_physical_replication_slot('replication_slot');
 ```
 
-> **Note:** In the current setup, `pg_basebackup -Xs` uses a temporary slot (`pg_basebackup_NNN`) for the initial backup, and the standby falls back to streaming via `primary_conninfo` from `postgresql.auto.conf`. The permanent slot is available for future use if you switch to explicit slot-based streaming.
-
-### 10.3 `pg_hba.conf` and `hba_file`
+### 11.3 `pg_hba.conf` and `hba_file`
 
 `pg_hba.conf` controls client authentication. PostgreSQL reads it from the data directory by default. Since we want to keep configuration in version-controlled files outside the container, we:
 1. Mount the file at `/etc/postgresql/pg_hba.conf`.
 2. Add `hba_file = '/etc/postgresql/pg_hba.conf'` to `postgresql.conf` so PostgreSQL reads the mounted file.
 
-Without this directive, PostgreSQL silently reads the default file inside the data directory, and any replication rule you add to the mounted file has no effect. This was the source of one of the failures in Phase 3.
+Without this directive, PostgreSQL silently reads the default file inside the data directory, and any replication rule you add to the mounted file has no effect.
 
-### 10.4 Privilege Drop in the Official Image
+### 11.4 Privilege Drop in the Official Image
 
 The official `postgres` image's entrypoint runs as **root** initially, performs setup, then uses `gosu` to drop privileges to the `postgres` user before starting the server. If you override `command:` with a raw `bash -c "postgres ..."`, that drop never happens, and PostgreSQL refuses to start with:
 ```
 "root" execution of the PostgreSQL server is not permitted.
 ```
-The correct pattern is to provide a **wrapper entrypoint** that does pre-start work and then `exec`s the official entrypoint, letting the original privilege drop happen.
+The correct pattern is to provide a **wrapper entrypoint** that does pre-start work and then `exec`s the official entrypoint.
 
-### 10.5 Docker Bridge Networking + Published Ports
+Similarly, `pg_ctl promote` and other administrative commands must be run with `-u postgres` because `pg_ctl` refuses to execute as root.
+
+### 11.5 PostgreSQL Timelines
+
+Every promotion creates a new **timeline** — an ordered sequence of WAL records starting from the promotion point. Timelines ensure that after a failover, the new primary's WAL history diverges cleanly from the old primary's, so WAL from the old branch can never be mistakenly applied.
+
+- A freshly initialized cluster starts at **timeline 1**.
+- The first promotion bumps to **timeline 2**.
+- Each subsequent promotion increments further.
+
+The standby that rejoins a promoted primary must be re-based from the new timeline's history, which is why the old primary's data directory must be wiped before rejoining — it belongs to the old timeline branch and cannot be reconciled.
+
+### 11.6 Docker Bridge Networking + Published Ports
 
 When you specify `ports: - "5432:5432"`:
 1. Docker gives the container an internal IP (e.g. `172.18.0.2`).
@@ -648,31 +949,65 @@ When you specify `ports: - "5432:5432"`:
 
 **You never need to reference the container's internal IP from outside the host.** Remote clients connect to the host IP and port; Docker handles the translation.
 
-### 10.6 The `iptables DOCKER` Chain
+### 11.7 The `iptables DOCKER` Chain
 
 Docker maintains its own iptables chain called `DOCKER`. Rules here are executed for packets destined to published container ports. Docker inserts `ACCEPT` rules automatically when containers start.
 
-**Any additional rules you add manually** (like blanket `DROP`s for security hardening) will sit alongside Docker's rules. If they end up *above* Docker's `ACCEPT`, they'll silently drop traffic to your containers. This caused our earlier "connection refused despite healthy container" symptom.
+**Any additional rules you add manually** (like blanket `DROP`s for security hardening) will sit alongside Docker's rules. If they end up *above* Docker's `ACCEPT`, they'll silently drop traffic to your containers.
 
 **Lesson:** Never insert `DROP` rules into the `DOCKER` chain. Use the `DOCKER-USER` chain instead, which is designed for user-defined policies and is evaluated *before* `DOCKER`.
 
 ---
 
-## 11. Issues Encountered & Resolutions
+## 12. Issues Encountered & Resolutions
+
+### 12.1 Phase 1 & 2 (Abandoned Toolchains)
 
 | # | Issue | Root Cause | Resolution |
 |---|-------|-----------|------------|
-| 1 | `docker port` returned nothing | Container created before `ports:` was added to compose file | `docker compose down && up -d` to recreate |
-| 2 | `Connection refused` despite healthy container | Rogue `DROP` rules at top of iptables `DOCKER` chain | Manually removed with `iptables -D DOCKER` |
-| 3 | `pg_basebackup: no pg_hba.conf entry for replication` | PostgreSQL read the HBA in the data dir, not the mounted file | Added `hba_file = '/etc/postgresql/pg_hba.conf'` to `postgresql.conf` |
-| 4 | `"root" execution of the PostgreSQL server is not permitted` | Overriding `command:` bypassed the image's privilege-drop entrypoint | Rewrote standby as a wrapper entrypoint that `exec`s the official one |
-| 5 | `cannot attach stdin to a TTY` when piping heredoc | `docker exec -it` conflicts with non-TTY stdin | Use `docker exec -i` (no `-t`) for piped input |
+| 1 | Patroni REST API unreachable | etcd had not formed quorum | Abandoned toolchain |
+| 2 | etcd peer unreachable across bridge | Port 2380 unpublished | Switched to `--network host` |
+| 3 | Stale etcd bootstrap | Anonymous volume survived `docker rm` | Manual `docker volume rm` |
+| 4 | Missing `replicator` role | Patroni bootstrap did not create it | Manual `CREATE ROLE` |
+| 5 | `md5` vs `scram-sha-256` mismatch | HBA method incompatible with password hash | Manual HBA edit |
+| 6 | Native PostgreSQL on host held port 5432 | System PostgreSQL running | `systemctl stop postgresql@*` |
+| 7 | Repmgr node name format rejected | Requires `<name>-<digit>` | Renamed to `node-1` / `node-2` |
+| 8 | `repmgr` CLI unusable in container | UID 1001 has no passwd entry; root rejected | Abandoned toolchain |
+
+### 12.2 Phase 3 (Working Solution)
+
+| # | Issue | Root Cause | Resolution |
+|---|-------|-----------|------------|
+| 9 | `docker port` returned nothing | Container created before `ports:` was added | `docker compose down && up -d` |
+| 10 | `Connection refused` despite healthy container | Rogue `DROP` rules in `DOCKER` chain | `iptables -D DOCKER <n>` |
+| 11 | Deleted wrong iptables rule | Incorrect rule number provided | Recreated container to re-insert ACCEPT |
+| 12 | `pg_basebackup: no pg_hba.conf entry` | PostgreSQL read HBA from data dir | Added `hba_file` directive |
+| 13 | `"root" execution ... not permitted` | Custom `command:` bypassed entrypoint | Wrapper `entrypoint:` that `exec`s original |
+| 14 | `cannot attach stdin to a TTY` with heredoc | `-t` conflicts with piped stdin | Use `docker exec -i` |
+| 15 | Config files unreadable by container | Host file permissions | `chmod 644` on mounted `.conf` files |
+
+### 12.3 Failover Phase
+
+| # | Issue | Root Cause | Resolution |
+|---|-------|-----------|------------|
+| 16 | `pg_ctl: cannot be run as root` | Docker exec default user is root | `docker exec -u postgres -i ... pg_ctl promote` |
+| 17 | Orphan container held port 5432 | `docker compose down` doesn't remove services not in current compose file | `docker compose down --remove-orphans` |
+| 18 | Orphan volume could not be removed | Attached to a stopped-but-not-removed container | `docker rm <container>` before `docker volume rm` |
+| 19 | Wrapper entrypoint blocked on restart | Wait-loop was outside the `if [ ! -f PG_VERSION ]` block | Move the wait-loop inside the `if` |
+| 20 | Standby never re-joined as primary after role flip | Wrapper kept waiting for the old primary IP | Rewrite wrapper to target the new primary |
+
+### 12.4 Recurring / Unresolved
+
+| # | Issue | Status |
+|---|-------|--------|
+| 21 | Rogue `DROP` rules reappear in `DOCKER` chain | Source script still unidentified; mitigated by manual cleanup |
+| 22 | Sequence ID gaps after failover | Inherent to physical replication; documented; use `CACHE 1` or UUIDs if strict ordering needed |
 
 ---
 
-## 12. Operational Runbook
+## 13. Operational Runbook
 
-### 12.1 Daily Operations
+### 13.1 Daily Operations
 
 **Check cluster health (on primary):**
 ```bash
@@ -692,7 +1027,7 @@ docker logs postgres-primary --tail 100
 docker logs postgres-standby --tail 100
 ```
 
-### 12.2 Restart a Node
+### 13.2 Restart a Node
 
 **Restart standby (safe):**
 ```bash
@@ -706,53 +1041,93 @@ cd ~/pg-ha-cluster
 docker compose restart postgres-primary
 ```
 
-### 12.3 Failover Procedure (Manual)
+### 13.3 Failover Procedure (Tested)
 
-**Step 1 — Promote the standby (Node 2):**
+**Phase 1 — Promote the standby:**
+
 ```bash
-docker exec -i postgres-standby pg_ctl promote -D /var/lib/postgresql/data
+# Stop the current primary (simulates failure or planned maintenance)
+# On Node 1 (current primary):
+cd ~/pg-ha-cluster
+docker compose stop postgres-primary
+
+# Promote Node 2 (current standby)
+# On Node 2:
+docker exec -u postgres -i postgres-standby pg_ctl promote -D /var/lib/postgresql/data
+
+# Verify promotion
+docker exec -i postgres-standby psql -U admin -d mydb -c "SELECT pg_is_in_recovery();"
+# expected: f
+docker exec -i postgres-standby psql -U admin -d mydb -c "SELECT timeline_id FROM pg_control_checkpoint();"
+# expected: 2 (or higher)
 ```
 
-**Step 2 — Verify promotion:**
+**Phase 2 — Add replication HBA rule to the new primary:**
+
 ```bash
+# On Node 2:
+echo "host replication replicator 0.0.0.0/0 md5" >> ~/pg-ha-cluster/standby/pg_hba.conf
+docker compose restart postgres-standby
 docker exec -i postgres-standby psql -U admin -d mydb -c \
-  "SELECT pg_is_in_recovery();"
+  "SELECT type, database, user_name, address FROM pg_hba_file_rules WHERE type='host';"
 ```
-Expected: `f`.
 
-**Step 3 — Redirect application writes to Node 2.**
+**Phase 3 — Convert old primary into a standby of the new primary:**
 
-**Step 4 — Rejoin Node 1 as a standby (once it's back online):**
 ```bash
-# On Node 1
-docker compose down
-docker volume rm pg-ha-cluster_primary_data
-docker compose up -d
-```
-But first, swap the roles: Node 1's `docker-compose.yml` must be adapted to run as a standby (pointing to Node 2 as the primary). This requires switching the compose file between the "primary" and "standby" definitions — a known manual step in a two-node setup.
+# On Node 1 (old primary):
+cd ~/pg-ha-cluster
+cp docker-compose.yml docker-compose.yml.primary-backup
 
-### 12.4 Full Cluster Rebuild
+# Write a new compose file with the standby service (see §7 for template)
+# Ensure standby-entrypoint.sh targets 192.168.0.163:5433
+
+docker compose down --remove-orphans
+docker volume rm pg-ha-cluster_primary_data
+docker volume rm pg-ha-cluster_standby_data
+docker compose up -d
+docker compose logs -f postgres-standby-node1
+```
+
+Look for: `entering standby mode`, `started streaming WAL from primary at timeline 2`, `database system is ready to accept read-only connections`.
+
+**Phase 4 — Verify:**
+
+```bash
+# On Node 2 (new primary):
+docker exec -i postgres-standby psql -U admin -d mydb -c \
+  "SELECT client_addr, state FROM pg_stat_replication;"
+# expected: 192.168.0.28 / streaming
+
+# On Node 1 (new standby):
+docker exec -i postgres-standby-node1 psql -U admin -d mydb -c \
+  "SELECT pg_is_in_recovery();"    # t
+docker exec -i postgres-standby-node1 psql -U admin -d mydb -c \
+  "SELECT timeline_id FROM pg_control_checkpoint();"    # 2
+```
+
+### 13.4 Full Cluster Rebuild
 
 **On both nodes:**
 ```bash
-docker compose down
-docker volume rm pg-ha-cluster_primary_data pg-ha-cluster_standby_data
+docker compose down --remove-orphans
+docker volume rm pg-ha-cluster_primary_data pg-ha-cluster_standby_data 2>/dev/null
 ```
 
-**On Node 1:**
+**On Node 1 (primary):**
 ```bash
-docker compose up -d
+docker compose up -d    # using the primary compose file
 ```
 
 Wait for `database system is ready to accept connections`.
 
-**On Node 2:**
+**On Node 2 (standby):**
 ```bash
-docker compose up -d
+docker compose up -d    # using the standby compose file
 docker compose logs -f postgres-standby
 ```
 
-### 12.5 Backup
+### 13.5 Backup
 
 **Physical backup (on primary):**
 ```bash
@@ -766,11 +1141,20 @@ docker cp postgres-primary:/tmp/backup ./backup-$(date +%F).tar.gz
 docker exec -i postgres-primary pg_dump -U admin -d mydb -Fc > mydb-$(date +%F).dump
 ```
 
+### 13.6 Best Practices Established
+
+1. **Always use `docker compose down --remove-orphans`** when switching compose file versions (e.g. between primary and standby roles). Otherwise old containers linger and hold ports.
+2. **Always run `pg_ctl` with `-u postgres`** inside the official image. The default docker exec user is `root`, which `pg_ctl` rejects.
+3. **The wrapper entrypoint's wait-loop must be inside the `if [ ! -f PG_VERSION ]` block.** An already-initialized container must not wait for a primary.
+4. **Never insert `DROP` rules into the `DOCKER` iptables chain.** Use `DOCKER-USER` for custom policies.
+5. **Mounted config files must be `chmod 644`** and referenced explicitly via `hba_file` / `config_file` directives.
+6. **Named volumes must be removed explicitly by name**, not via `docker volume prune` (which only removes truly dangling volumes).
+
 ---
 
-## 13. Next Steps — pgactive Multi-Master
+## 14. Next Steps — pgactive Multi-Master
 
-### 13.1 What Needs to Happen
+### 14.1 What Needs to Happen
 
 1. **Build a custom Docker image** based on `postgres:17-bookworm` that compiles and installs the `pgactive` extension (v2.1.7).
 2. **Deploy one container per node** with `shared_preload_libraries = 'pgactive'` and logical replication settings.
@@ -778,7 +1162,7 @@ docker exec -i postgres-primary pg_dump -U admin -d mydb -Fc > mydb-$(date +%F).
 4. **Test bidirectional writes** with a dummy table.
 5. **Monitor conflict history** via `pgactive_conflict_history`.
 
-### 13.2 Dockerfile Sketch
+### 14.2 Dockerfile Sketch
 
 ```dockerfile
 FROM postgres:17-bookworm AS builder
@@ -807,7 +1191,7 @@ COPY --from=builder /usr/lib/postgresql/17/lib/pgactive.so /usr/lib/postgresql/1
 COPY --from=builder /usr/share/postgresql/17/extension/pgactive* /usr/share/postgresql/17/extension/
 ```
 
-### 13.3 Configuration Additions
+### 14.3 Configuration Additions
 
 To the `postgresql.conf` used by each multi-master node:
 ```conf
@@ -823,29 +1207,30 @@ max_sync_workers_per_subscription = 8
 pgactive.max_nodes = 16
 ```
 
-### 13.4 Key Operational Caveat
+### 14.4 Key Operational Caveat
 
 **DDL is not replicated by pgactive.** Any `CREATE TABLE`, `ALTER TABLE`, or index change must be applied to **every node**. Plan your migrations accordingly.
 
-### 13.5 Open Questions
+### 14.5 Open Questions
 
 - Conflict resolution strategy for concurrent writes to the same row.
-- Whether `pgactive` is production-grade for the intended workload (it's an AWS extension, but not as widely deployed as logical replication via `pglogical` or native `logical replication`).
+- Whether `pgactive` is production-grade for the intended workload.
 - Monitoring hooks for `pgactive_conflict_history` and `pgactive_stats`.
 
 ---
 
-## 14. Appendices
+## 15. Appendices
 
 ### Appendix A — Complete Command Reference
 
 **Container lifecycle:**
 ```bash
-docker compose up -d                # Start in background
-docker compose down                 # Stop and remove
-docker compose logs -f <service>    # Stream logs
-docker compose restart <service>    # Restart
-docker volume rm <volume>           # Delete a volume
+docker compose up -d                          # Start in background
+docker compose down                           # Stop and remove
+docker compose down --remove-orphans          # Also remove orphan containers
+docker compose logs -f <service>              # Stream logs
+docker compose restart <service>              # Restart
+docker volume rm <volume>                     # Delete a volume
 ```
 
 **Database access:**
@@ -855,15 +1240,23 @@ docker exec -i postgres-standby psql -U admin -d mydb -c "SQL..."
 docker exec -i postgres-primary psql -U admin -d mydb <<'EOF' ... EOF
 ```
 
+**Administrative operations (must use `-u postgres`):**
+```bash
+docker exec -u postgres -i postgres-standby pg_ctl promote -D /var/lib/postgresql/data
+docker exec -u postgres -i postgres-standby pg_ctl status -D /var/lib/postgresql/data
+```
+
 **Replication diagnostics:**
 ```sql
 -- On primary
 SELECT client_addr, state, sync_state, replay_lag FROM pg_stat_replication;
+SELECT timeline_id FROM pg_control_checkpoint();
 
 -- On standby
 SELECT pg_is_in_recovery();
 SELECT now() - pg_last_xact_replay_timestamp() AS replay_lag;
 SELECT * FROM pg_stat_wal_receiver;
+SELECT timeline_id FROM pg_control_checkpoint();
 
 -- Replication slots
 SELECT * FROM pg_replication_slots;
@@ -887,6 +1280,8 @@ sudo iptables -L DOCKER -n
 | Config loading | Mounted file ignored | `SHOW hba_file`, `SHOW config_file` |
 | Privilege | `"root" execution ... not permitted` | Container `entrypoint`, `user:` |
 | Replication | `pg_stat_replication` empty | `primary_conninfo`, network, HBA |
+| Failover | Standby refuses to promote | `pg_ctl promote`, `pg_is_in_recovery()` |
+| Timeline | Standby won't rejoin after failover | Timeline mismatch — wipe and re-base |
 | Storage | `Resource busy`, `could not remove` | Stopped processes, volume state |
 
 ### Appendix C — Glossary
@@ -905,13 +1300,12 @@ sudo iptables -L DOCKER -n
 | **`pg_basebackup -R`** | Flag that auto-generates `standby.signal` and `primary_conninfo` |
 | **`gosu`** | The tool the official image uses to drop privileges |
 | **Promotion** | Converting a standby into a primary (`pg_ctl promote`) |
+| **Timeline** | An ordered sequence of WAL records; each promotion creates a new one |
 | **Quorum** | Majority agreement needed by distributed consensus systems (etcd, Consul) |
 | **Witness node** | A third node that doesn't store data but participates in quorum |
+| **Orphan container** | A container whose service was removed from the compose file but is still running |
 | **pgactive** | AWS logical replication extension for PostgreSQL multi-master |
 
 ---
 
 **Document End.**
-
-*For questions or updates, contact the database infrastructure team.*
-```
